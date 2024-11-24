@@ -4,6 +4,15 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+	<AssemblyVersion>1.6.0.0</AssemblyVersion>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="Aid.Version.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="Boilerplates\Aid.Version.cs" />
+  </ItemGroup>
 
 </Project>

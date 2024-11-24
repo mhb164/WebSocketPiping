@@ -1,14 +1,13 @@
-﻿using Microsoft.Extensions.Logging;
+﻿using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
 
 namespace WebSocketPiping;
-
 public sealed class WebSocketPipe : IDisposable
 {
-    private readonly string RemoteIpAddress;
+    public readonly string RemoteIpAddress;
     private readonly WebSocket _source;
     private readonly ILogger? _logger;
 
@@ -22,60 +21,39 @@ public sealed class WebSocketPipe : IDisposable
         _logger = logger;
     }
 
-    private Socket? _destinationSocket;
-
-    public Guid Key { get; private set; }
-    public string? Host { get; private set; }
-    public ushort Port { get; private set; }
-    public bool KeepAlive { get; private set; }
-
-    public string Name => $"[{RemoteIpAddress}-{Key}] {Host}:{Port}{(KeepAlive ? " (KeepAlive)" : "")}";
+    private Socket? _destination;
+    public PipeInfo? Info { get; private set; }
+    public string Name => $"[{RemoteIpAddress}]{Info}";
 
     public async Task HandleAsync()
     {
         _logger?.LogInformation("{RemoteIpAddress}> New WebSocket connected!", RemoteIpAddress);
+
         try
         {
+            var pipeInfoText = await GetPipeInfoText();
 
-            var buffer = new byte[8192];
-            var receiveResult = await _source.ReceiveAsync(buffer, CancellationToken.None);
+            Info = PipeInfo.Parse(pipeInfoText);
 
-            var startCommand = Encoding.UTF8.GetString(buffer, 0, receiveResult.Count);
-            var startCommandParameters = startCommand.Split(",");
+            _logger?.LogInformation("{Name}> Pipe info received, start piping...", Name);
 
-            Key = Guid.Parse(startCommandParameters[0]);
-            Host = startCommandParameters[1];
-            Port = ushort.Parse(startCommandParameters[2]);
-            KeepAlive = startCommandParameters[3] == "true";
+            _destination = await CreateDestination(Info);
 
-            _logger?.LogInformation("{Name}> Handle started", Name);
-
-            await Connect();
-
-            if (_destinationSocket == null || !_destinationSocket.Connected)
+            if (_destination == null || !_destination.Connected)
                 return;
 
-            _logger?.LogInformation("{Name}> Connected", Name);
-
-            new Thread(StartDataReceive) { IsBackground = true }.Start();
+            _logger?.LogInformation("{Name}> Pipe destination connected", Name);
 
             await _source.SendAsync(Encoding.UTF8.GetBytes("OK"), WebSocketMessageType.Text, true, CancellationToken.None);
 
-            receiveResult = await _source.ReceiveAsync(buffer, CancellationToken.None);
+            StartDestinationToSource();
+            var receiveResult = await SourceToDestination();
 
-            while (!receiveResult.CloseStatus.HasValue)
-            {
-                var data = new byte[receiveResult.Count];
-                Array.Copy(buffer, data, receiveResult.Count);
-
-                await _destinationSocket.SendAsync(data);
-                receiveResult = await _source.ReceiveAsync(buffer, CancellationToken.None);
-            }
-
-            await _source.CloseAsync(
-                receiveResult.CloseStatus.Value,
-                receiveResult.CloseStatusDescription,
-                CancellationToken.None);
+            if (receiveResult?.CloseStatus is not null)
+                await _source.CloseAsync(
+                    receiveResult.CloseStatus.Value,
+                    receiveResult.CloseStatusDescription,
+                    CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -89,55 +67,102 @@ public sealed class WebSocketPipe : IDisposable
         _logger?.LogInformation("{Name}> Handle finished", Name);
     }
 
-    private async Task Connect()
+    private async Task<string> GetPipeInfoText()
     {
+        var buffer = new byte[1024];
+        var receiveResult = await _source.ReceiveAsync(buffer, CancellationToken.None);
+        return Encoding.UTF8.GetString(buffer, 0, receiveResult.Count);
+    }
+
+    private static async Task<Socket> CreateDestination(PipeInfo? info)
+    {
+        ArgumentNullException.ThrowIfNull(info);
+
+        var address = await info.GetHostAddress();
+        var endPoint = new IPEndPoint(address, info.Port);
+
+        var socket = default(Socket);
         try
         {
-            var hostEntry = await Dns.GetHostEntryAsync(Host);
-            var destinationEndPoint = new IPEndPoint(hostEntry.AddressList[0], Port);
-            _destinationSocket = new Socket(destinationEndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            socket = new Socket(endPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            if (info.KeepAlive)
+                socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, 1);
 
-            if (KeepAlive)
-                _destinationSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, 1);
+            await socket.ConnectAsync(endPoint);
 
-            await _destinationSocket.ConnectAsync(destinationEndPoint);
+            return socket;
         }
-        catch (Exception ex)
+        catch
         {
-            _logger?.LogError(ex, "{Name}> Connect failed!", Name);
-            Dispose();
+            Dispose(socket);
+            throw;
         }
     }
 
-    private async void StartDataReceive()
+    private void StartDestinationToSource()
     {
-        _logger?.LogInformation("{Name}> DataReceive started", Name);
-        var buffer = new byte[8192];
-        try
+        new Thread(async () =>
         {
-            var receiveCount = await _destinationSocket!.ReceiveAsync(buffer, CancellationToken.None);
-            while (receiveCount > 0)
+            ArgumentNullException.ThrowIfNull(_destination);
+
+            _logger?.LogInformation("{Name}> Destination -> Source started", Name);
+            var buffer = new byte[8192];
+
+            try
             {
-                var data = new byte[receiveCount];
-                Array.Copy(buffer, data, receiveCount);
+                var receiveCount = await _destination.ReceiveAsync(buffer, CancellationToken.None);
+                while (receiveCount > 0)
+                {
+                    var data = new byte[receiveCount];
+                    Array.Copy(buffer, data, receiveCount);
 
-                await _source.SendAsync(data, WebSocketMessageType.Binary, false, CancellationToken.None);
+                    await _source.SendAsync(data, WebSocketMessageType.Binary, false, CancellationToken.None);
 
-                receiveCount = await _destinationSocket!.ReceiveAsync(buffer, CancellationToken.None);
+                    receiveCount = await _destination.ReceiveAsync(buffer, CancellationToken.None);
+                }
             }
-        }
-        catch (Exception ex)
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "{Name}> Destination -> Source failed!", Name);
+                Dispose();
+            }
+        })
+        { IsBackground = true }.Start();
+    }
+
+    private async Task<WebSocketReceiveResult> SourceToDestination()
+    {
+        ArgumentNullException.ThrowIfNull(_destination);
+
+        _logger?.LogInformation("{Name}> Source -> Destination started", Name);
+
+        var buffer = new byte[8192];
+        var receiveResult = await _source.ReceiveAsync(buffer, CancellationToken.None);
+
+        while (!receiveResult.CloseStatus.HasValue)
         {
-            _logger?.LogError(ex, "{Name}> StartDataReceive failed!", Name);
-            Dispose();
+            var data = new byte[receiveResult.Count];
+            Array.Copy(buffer, data, receiveResult.Count);
+
+            await _destination.SendAsync(data);
+            receiveResult = await _source.ReceiveAsync(buffer, CancellationToken.None);
         }
+
+        return receiveResult;
     }
 
     public void Dispose()
     {
-        try { _destinationSocket?.Shutdown(SocketShutdown.Both); } catch { }
-        try { _destinationSocket?.Dispose(); } catch { }
-        try { _source?.Dispose(); } catch { }
+        Dispose(_destination);
+    }
+
+    private static void Dispose(Socket? socket)
+    {
+        if (socket is null)
+            return;
+
+        try { socket.Shutdown(SocketShutdown.Both); } catch { /*Just need to make sure*/ }
+        try { socket.Dispose(); } catch { /*Just need to make sure*/ }
     }
 }
 
